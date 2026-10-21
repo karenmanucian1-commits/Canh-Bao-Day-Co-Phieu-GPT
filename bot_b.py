@@ -731,6 +731,51 @@ def send_telegram(message):
     r.raise_for_status()
 
 
+def liquid_universe(symbols, args):
+    """Reuse recent cached OHLCV to skip illiquid stocks before API calls.
+
+    Unknown symbols remain eligible for scanning. Every Monday, perform a
+    full universe review to allow previously illiquid stocks to re-enter.
+    """
+    if args.symbols or args.refresh:
+        return symbols
+    OUTPUT.mkdir(exist_ok=True)
+    index_path = OUTPUT / 'liquidity_universe.csv'
+    today = datetime.now().date()
+    # Full refresh every Monday; also when the index is missing or old.
+    full_review = today.weekday() == 0 or not index_path.exists()
+    known = {}
+    if index_path.exists():
+        try:
+            index = pd.read_csv(index_path, dtype={'symbol': str})
+            known = {str(r['symbol']): r for _, r in index.iterrows()}
+            updated = pd.to_datetime(index['checked_at'], errors='coerce').max()
+            if pd.isna(updated) or (today - updated.date()).days >= 7:
+                full_review = True
+        except (OSError, ValueError, KeyError):
+            full_review = True
+            known = {}
+    if full_review:
+        print('🔄 Rà soát lại thanh khoản toàn thị trường (định kỳ hoặc thiếu dữ liệu).', flush=True)
+        return symbols
+    kept = []
+    excluded = 0
+    for sym in symbols:
+        item = known.get(sym)
+        if item is None:
+            kept.append(sym)
+            continue
+        vol = number(item.get('volume_avg20'))
+        traded = number(item.get('traded_sessions20'))
+        # Unknown/invalid metrics must never lead to exclusion.
+        if vol is not None and traded is not None and (vol < 10000 or traded < 15):
+            excluded += 1
+        else:
+            kept.append(sym)
+    print(f'💧 Lọc trước: loại {excluded} mã thanh khoản kém theo dữ liệu lưu; quét {len(kept)}/{len(symbols)} mã.', flush=True)
+    return kept
+
+
 def run(args):
     OUTPUT.mkdir(exist_ok=True)
     end = datetime.now()
@@ -738,6 +783,8 @@ def run(args):
     symbols = args.symbols or kbs_client.danh_sach_co_phieu()
     if not symbols:
         raise RuntimeError('Danh sách mã trống từ KBS, dừng để tránh báo cáo sai.')
+    all_symbols = list(symbols)
+    symbols = liquid_universe(symbols, args)
     rows, failures = [], []
     audit = []
     def mark(sym, reason, session=None, **metrics):
@@ -759,13 +806,17 @@ def run(args):
             if (end.date() - last_session).days > 10:
                 mark(sym,"STALE_OVER_10_DAYS",last_session); continue
             p = df.iloc[-1]
+            liquidity_vol20 = float(df['volume'].tail(20).mean())
+            liquidity_traded20 = int((pd.to_numeric(df['volume'].tail(20), errors='coerce') > 0).sum())
+            # Store liquidity even when RSI/MFI fails, for next scan prefilter.
+            liquidity_record = dict(volume_avg20=liquidity_vol20, traded_sessions20=liquidity_traded20)
             vals = [number(p[k]) for k in ('rsi14','rsi7','mfi14','mfi11')]
             metrics=dict(zip(("rsi14","rsi7","mfi14","mfi11"),vals))
             if any(x is None for x in vals):
-                mark(sym,"INDICATOR_MISSING",last_session,**metrics); continue
+                mark(sym,"INDICATOR_MISSING",last_session,**metrics,**liquidity_record); continue
             failed=[key for key,val,threshold in zip(("RSI14","RSI7","MFI14","MFI11"),vals,(30,30,20,20)) if val>=threshold]
             if failed:
-                mark(sym,"FILTER_"+"_".join(failed),last_session,**metrics); continue
+                mark(sym,"FILTER_"+"_".join(failed),last_session,**metrics,**liquidity_record); continue
             # Điều kiện thứ 5: KL bình quân đúng 20 phiên gần nhất PHẢI > 10.000 CP/phiên.
             vol20 = float(df['volume'].tail(20).mean())
             if not pd.notna(vol20) or vol20 <= 10000:
@@ -833,6 +884,28 @@ def run(args):
     audit_path = OUTPUT/f"scan_audit_{date}{suffix}.csv"
     summary_path = OUTPUT/f"scan_audit_summary_{date}{suffix}.csv"
     pd.DataFrame(audit,columns=["symbol","reason","last_session","rows_api","rsi14","rsi7","mfi14","mfi11","volume_avg20","traded_sessions20","error"]).to_csv(audit_path,index=False,encoding="utf-8-sig")
+    # Persist observed 20-session liquidity for next scheduled scan.
+    # Never mark missing metrics as illiquid; retain previous known metrics.
+    if not args.symbols:
+        index_path = OUTPUT / 'liquidity_universe.csv'
+        prior = {}
+        if index_path.exists():
+            try:
+                previous = pd.read_csv(index_path, dtype={'symbol': str})
+                prior = {str(rec['symbol']): rec.to_dict() for _, rec in previous.iterrows()}
+            except (OSError, ValueError, KeyError):
+                pass
+        stamp = end.strftime('%Y-%m-%d')
+        for rec in audit:
+            sym = rec['symbol']
+            vol = number(rec.get('volume_avg20'))
+            traded = number(rec.get('traded_sessions20'))
+            if vol is not None and traded is not None:
+                prior[sym] = dict(symbol=sym, volume_avg20=vol, traded_sessions20=int(traded),
+                                  checked_at=stamp)
+        pd.DataFrame([prior[s] for s in all_symbols if s in prior],
+                     columns=['symbol','volume_avg20','traded_sessions20','checked_at']).to_csv(
+                         index_path, index=False, encoding='utf-8-sig')
     counts=Counter(x["reason"] for x in audit)
     pd.DataFrame([{"reason":k,"count":v} for k,v in sorted(counts.items(),key=lambda x:(-x[1],x[0]))]).to_csv(summary_path,index=False,encoding="utf-8-sig")
     print(f"KIỂM TOÁN: {len(audit)}/{len(symbols)} mã | {audit_path} | {summary_path}")
