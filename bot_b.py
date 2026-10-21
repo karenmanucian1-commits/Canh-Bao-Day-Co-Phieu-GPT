@@ -73,45 +73,121 @@ def action_for_row(row):
 
 
 def send_daily_telegram(rows, reference_date, slot, date, count_scanned, error_count, stale_count, force=False):
+    """Send compact Telegram report; preserves original stock screening and scores."""
     token, chat_id = os.getenv('BOT_TOKEN'), os.getenv('CHAT_ID')
     if not token or not chat_id:
         raise RuntimeError('Thiếu BOT_TOKEN hoặc CHAT_ID trong .env. Không thể gửi Telegram.')
-    slot_name = '06:00 - TRƯỚC PHIÊN' if slot == 'morning' else ('11:31 - PHIÊN SÁNG' if slot == 'noon' else 'GỬI LẠI BÁO CÁO ĐÃ LƯU')
+
+    slot_name = {
+        'morning': '06:00 - PHÂN TÍCH PHIÊN TRƯỚC',
+        'noon': '11:31 - QUÉT SAU PHIÊN SÁNG',
+        'manual': 'GỬI LẠI BÁO CÁO ĐÃ LƯU',
+    }.get(slot, slot)
     marker = OUTPUT / f'telegram_sent_{date}_{slot}.ok'
     if marker.exists() and not force:
         print(f'Đã gửi báo cáo slot {slot} hôm nay; không gửi trùng. Dùng --telegram-resend để gửi lại.')
         return
-    header = (f'📊 BOT B | {slot_name} | {date}\n'
-              f'📅 Phiên dữ liệu mới nhất: {reference_date or "KHÔNG CÓ"}\n'
-              f'🔍 Đã xử lý: {count_scanned} mã | Đạt 6 điều kiện: {len(rows)} | '
-              f'Cần thẩm định: {sum(not r["eligible"] for r in rows)}\n'
-              f'⚠️ Lỗi xử lý: {error_count} | Mã đạt nhưng dữ liệu cũ: {stale_count}\n'
-              'Chỉ phân tích mã đạt đủ 6 điều kiện; đây không phải lệnh mua tự động.')
-    # send separately, with a hard failure propagated to the scheduler logs
-    send_telegram(header)
-    if not rows:
-        send_telegram('Không có cổ phiếu nào đạt đủ 6 điều kiện tại phiên tham chiếu. Không cố chọn mã để mua.')
-    for row in rows:
-        symbol=row['symbol']
-        msg=(f'🏆 #{row["rank"]} {symbol} | {action_for_row(row)}\n'
-             f'📅 {row["last_date"]} | Giá {fmt_telegram(row["price"])} nghìn đồng\n'
-             f'⭐ Điểm tổng: {fmt_telegram(row["total"],1)}/100 | 🏢 Chất lượng DN: {fmt_telegram(row["quality"],1)}/100 | 📉 Tín hiệu tạo đáy: {fmt_telegram(row["bottom"],1)}/100\n'
-             f'🧭 {row["status"]} | Nhóm {"A" if row["eligible"] else "B - cần thẩm định"}\n'
-             f'📉 RSI14 {fmt_telegram(row["rsi14"],1)}; RSI7 {fmt_telegram(row["rsi7"],1)}; '
-             f'MFI14 {fmt_telegram(row["mfi14"],1)}; MFI11 {fmt_telegram(row["mfi11"],1)}\n'
-             f'💧 KL TB20 {fmt_telegram(row["volume"],0)} | Phiên có GD {row["traded_sessions20"]}/20\n'
-             f'💰 ROE {fmt_telegram(row["fin_roe"],1)}% | EPS {fmt_telegram(row["fin_eps"],0)} | '
-             f'P/E {fmt_telegram(row["fin_pe"],1)} | P/B {fmt_telegram(row["fin_pb"],2)}\n'
-             f'🟢 Giá theo dõi: {fmt_telegram(row["price"])} | 🛑 Stop tham khảo: {fmt_telegram(row["stop"])}\n'
-             f'🎯 Target 1: {fmt_telegram(row["target1"])} | Target 2: {fmt_telegram(row["target2"])} | '
-             f'R:R1 {fmt_telegram(row["rr1"],2)}\n'
-             f'⚠️ Rủi ro: {row["risk_label"]} | Độ tin cậy: {row["trust_label"]}\n'
-             f'📌 {row["advice"]}')
-        # newlines are already present
-        # Telegram text limit 4096 chars, cut on unicode codepoints with margin
-        for i in range(0,len(msg),3500):
-            send_telegram(msg[i:i+3500])
-    marker.write_text(f'{datetime.now().isoformat()}\nreference_date={reference_date}\n', encoding='utf-8')
+
+    def short_action(row):
+        action = action_for_row(row)
+        if 'KHÔNG MUA' in action:
+            return '🔴 CHƯA MUA'
+        if 'THĂM DÒ' in action:
+            return '🟢 CÂN NHẮC THĂM DÒ'
+        return '🟡 THEO DÕI'
+
+    def short_advice(row):
+        notes = []
+        quality = number(row.get('quality'))
+        bottom_score = number(row.get('bottom'))
+        roe = number(row.get('fin_roe'))
+        pe = number(row.get('fin_pe'))
+        volume = number(row.get('volume'))
+        rr = number(row.get('rr1'))
+        rsi = number(row.get('rsi14'))
+
+        if quality is not None and quality >= 70:
+            notes.append('🟢 Tài chính nổi bật theo mô hình.')
+        elif (roe is not None and roe < 3) or (pe is not None and pe > 40):
+            notes.append('🔴 Tài chính/định giá chưa hấp dẫn.')
+
+        if bottom_score is not None and bottom_score >= 70:
+            notes.append('📈 Có tín hiệu phục hồi sơ bộ.')
+        elif rsi is not None and rsi < 10:
+            notes.append('📉 Quá bán cực sâu, chưa xác nhận đáy.')
+        else:
+            notes.append('📉 Quá bán, chưa xác nhận đáy.')
+
+        if volume is not None and volume < 50000:
+            notes.append('💧 Thanh khoản thấp, khó thoát hàng.')
+
+        if str(row.get('risk_label', '')) == 'RẤT CAO':
+            notes.append('⚠️ Rủi ro rất cao.')
+        elif rr is not None and rr < 1.5:
+            notes.append('⚠️ R:R chưa hấp dẫn.')
+
+        action = action_for_row(row)
+        if 'KHÔNG MUA' in action:
+            notes.append('🎯 Chưa mua, chờ tín hiệu phục hồi.')
+        elif 'THĂM DÒ' in action:
+            notes.append('🎯 Chỉ cân nhắc thăm dò sau xác minh.')
+        else:
+            notes.append('🎯 Theo dõi giá và thanh khoản.')
+
+        return '\n'.join('- ' + item for item in notes[:5])
+
+    # Report date is not proof of intraday snapshot time.
+    header = (
+        f'💥 CỔ PHIẾU VÙNG ĐÁY – GPT 💥\n\n'
+        f'📊 BOT B | {slot_name} | {date}\n'
+        f'📅 Ngày dữ liệu mới nhất: {reference_date or "N/A"}\n'
+        f'🔍 Đã quét: {count_scanned} mã\n'
+        f'✅ Đạt 6 điều kiện: {len(rows)} mã\n'
+        f'📋 Cần thẩm định: {sum(not r["eligible"] for r in rows)} mã\n'
+        f'⚠️ Lỗi: {error_count} | Mã đạt có dữ liệu cũ: {stale_count}\n\n'
+        f'🏆 DANH SÁCH MÃ ĐẠT ĐỦ 6 ĐIỀU KIỆN\n'
+    )
+    if rows:
+        for i, row in enumerate(rows, 1):
+            header += (
+                f'{i}. {row["symbol"]} – '
+                f'{fmt_telegram(row["total"], 1)} điểm | {short_action(row)}\n'
+            )
+    else:
+        header += 'Không có mã nào đạt bộ lọc.\n'
+    header += '\n📌 Đạt bộ lọc không đồng nghĩa có tín hiệu mua.'
+
+    for start in range(0, len(header), 3500):
+        send_telegram(header[start:start + 3500])
+
+    for i, row in enumerate(rows, 1):
+        msg = (
+            f'🏆 #{i} {row["symbol"]} | {short_action(row)}\n\n'
+            f'💵 Giá: {fmt_telegram(row["price"], 2)} nghìn đồng\n'
+            f'⭐ Tổng: {fmt_telegram(row["total"],1)}/100 | '
+            f'🏢 DN: {fmt_telegram(row["quality"],1)}/100 | '
+            f'📉 Đáy: {fmt_telegram(row["bottom"],1)}/100\n'
+            f'📉 RSI14: {fmt_telegram(row["rsi14"],1)} | RSI7: {fmt_telegram(row["rsi7"],1)}\n'
+            f'💧 MFI14: {fmt_telegram(row["mfi14"],1)} | MFI11: {fmt_telegram(row["mfi11"],1)}\n'
+            f'📊 KL TB20: {fmt_telegram(row["volume"],0)} | GD: {row["traded_sessions20"]}/20 phiên\n'
+            f'💰 ROE: {fmt_telegram(row["fin_roe"],1)}% | '
+            f'EPS: {fmt_telegram(row["fin_eps"],0)} | '
+            f'P/E: {fmt_telegram(row["fin_pe"],1)} | '
+            f'P/B: {fmt_telegram(row["fin_pb"],2)}\n'
+            f'🛑 Stoploss: {fmt_telegram(row["stop"],2)}\n'
+            f'🎯 Target 1: {fmt_telegram(row["target1"],2)} | '
+            f'Target 2: {fmt_telegram(row["target2"],2)}\n'
+            f'⚖️ R:R: 1:{fmt_telegram(row["rr1"],2)}\n'
+            f'⚠️ Rủi ro: {row["risk_label"]} | Tin cậy: {row["trust_label"]}\n\n'
+            f'📌 NHẬN ĐỊNH\n{short_advice(row)}'
+        )
+        for start in range(0, len(msg), 3500):
+            send_telegram(msg[start:start + 3500])
+
+    marker.write_text(
+        f'{datetime.now().isoformat()}\nreference_date={reference_date}\n',
+        encoding='utf-8'
+    )
     print(f'Đã gửi Telegram thành công: {len(rows)} mã; slot {slot}.')
 
 
