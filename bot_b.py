@@ -740,7 +740,7 @@ def liquid_universe(symbols, args):
     if args.symbols or args.refresh:
         return symbols
     OUTPUT.mkdir(exist_ok=True)
-    index_path = OUTPUT / 'liquidity_universe.csv'
+    index_path = OUTPUT / 'cache' / 'liquidity_universe.csv'
     today = datetime.now().date()
     # Full refresh every Monday; also when the index is missing or old.
     full_review = today.weekday() == 0 or not index_path.exists()
@@ -887,7 +887,7 @@ def run(args):
     # Persist observed 20-session liquidity for next scheduled scan.
     # Never mark missing metrics as illiquid; retain previous known metrics.
     if not args.symbols:
-        index_path = OUTPUT / 'liquidity_universe.csv'
+        index_path = OUTPUT / 'cache' / 'liquidity_universe.csv'
         prior = {}
         if index_path.exists():
             try:
