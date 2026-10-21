@@ -83,7 +83,7 @@ jobs:
           fi
 
       - name: Save cache
-        if: always()
+        if: ${{ always() && hashFiles('bot_b_output/cache/**') != '' }}
         uses: actions/cache/save@v4
         with:
           path: bot_b_output/cache
